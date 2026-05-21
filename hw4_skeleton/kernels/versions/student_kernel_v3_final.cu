@@ -161,6 +161,3 @@ void runStudent(int M, int N, int K, float alpha,
         fprintf(stderr, "StudentKernel sync error: %s\n", cudaGetErrorString(err));
     }
 }
-
-
-

@@ -1,0 +1,135 @@
+#include "../math_utils.h"
+#include <stdio.h>
+#include <cuda_runtime.h>
+
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 8;
+constexpr int TM = 8;
+constexpr int TN = 8;
+
+__global__ void StudentKernel(int M, int N, int K, float alpha,
+                              const float *__restrict__ A,
+                              const float *__restrict__ B,
+                              float beta, float *C) {
+    __shared__ float sA[BK][BM];
+    __shared__ float sB[BK][BN];
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int tid = ty * blockDim.x + tx;
+
+    float acc[TM][TN] = {0.0f};
+
+    const float4 *A_f4 = reinterpret_cast<const float4 *>(A);
+    const float4 *B_f4 = reinterpret_cast<const float4 *>(B);
+
+    int a_g_row = by * BM + (tid / 2);
+    int a_g_col_f4 = tid % 2;
+
+    int b_g_row = tid / 32;
+    int b_g_col_f4 = (bx * BN / 4) + (tid % 32);
+
+    int numTiles = (K + BK - 1) / BK;
+
+    for (int t = 0; t < numTiles; ++t) {
+        int tile_k = t * BK;
+
+        int a_col = tile_k + a_g_col_f4 * 4;
+        if (a_g_row < M && a_col < K) {
+            float4 tmpA = A_f4[a_g_row * (K / 4) + (tile_k / 4) + a_g_col_f4];
+            sA[a_g_col_f4 * 4 + 0][tid / 2] = tmpA.x;
+            sA[a_g_col_f4 * 4 + 1][tid / 2] = tmpA.y;
+            sA[a_g_col_f4 * 4 + 2][tid / 2] = tmpA.z;
+            sA[a_g_col_f4 * 4 + 3][tid / 2] = tmpA.w;
+        } else {
+            sA[a_g_col_f4 * 4 + 0][tid / 2] = 0.0f;
+            sA[a_g_col_f4 * 4 + 1][tid / 2] = 0.0f;
+            sA[a_g_col_f4 * 4 + 2][tid / 2] = 0.0f;
+            sA[a_g_col_f4 * 4 + 3][tid / 2] = 0.0f;
+        }
+
+        int b_row = tile_k + b_g_row;
+        if (b_row < K && (b_g_col_f4 * 4) < N) {
+            float4 tmpB = B_f4[b_row * (N / 4) + b_g_col_f4];
+            reinterpret_cast<float4 *>(sB[b_g_row])[tid % 32] = tmpB;
+        } else {
+            reinterpret_cast<float4 *>(sB[b_g_row])[tid % 32] =
+                make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float regA[TM];
+            float regB[TN];
+
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                regA[i] = sA[k][ty * TM + i];
+            }
+
+            #pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                regB[j] = sB[k][tx * TN + j];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        int g_row = by * BM + ty * TM + i;
+        if (g_row < M) {
+            int g_col_base = bx * BN + tx * TN;
+            if (g_col_base < N) {
+                int idx_f4_0 = g_row * (N / 4) + (g_col_base / 4);
+                float4 oldC_0 = reinterpret_cast<float4 *>(C)[idx_f4_0];
+                float4 newC_0;
+                newC_0.x = alpha * acc[i][0] + beta * oldC_0.x;
+                newC_0.y = alpha * acc[i][1] + beta * oldC_0.y;
+                newC_0.z = alpha * acc[i][2] + beta * oldC_0.z;
+                newC_0.w = alpha * acc[i][3] + beta * oldC_0.w;
+                reinterpret_cast<float4 *>(C)[idx_f4_0] = newC_0;
+
+                int idx_f4_1 = idx_f4_0 + 1;
+                float4 oldC_1 = reinterpret_cast<float4 *>(C)[idx_f4_1];
+                float4 newC_1;
+                newC_1.x = alpha * acc[i][4] + beta * oldC_1.x;
+                newC_1.y = alpha * acc[i][5] + beta * oldC_1.y;
+                newC_1.z = alpha * acc[i][6] + beta * oldC_1.z;
+                newC_1.w = alpha * acc[i][7] + beta * oldC_1.w;
+                reinterpret_cast<float4 *>(C)[idx_f4_1] = newC_1;
+            }
+        }
+    }
+}
+
+void runStudent(int M, int N, int K, float alpha,
+                float *A, float *B, float beta, float *C) {
+    dim3 block(BN / TN, BM / TM);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    StudentKernel<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "StudentKernel launch error: %s\n", cudaGetErrorString(err));
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "StudentKernel sync error: %s\n", cudaGetErrorString(err));
+    }
+}
